@@ -51,10 +51,17 @@ app.get('/api/images',async(req,res)=>{
  res.json({items,total,page,pages:Math.ceil(total/limit)});
 });
 app.get('/api/images/:id/download',validId,async(req,res,next)=>{
+ const requested=String(req.query.format||'png').toLowerCase();
+ const format=requested==='jpg'?'jpeg':requested;
+ if(!['png','jpeg','webp'].includes(format)) return res.status(400).json({message:'Choose PNG, JPEG or WebP'});
  const item=await Image.findById(req.params.id);if(!item) return res.status(404).json({message:'Image not found'});
  const file=await readFile(item.filename);if(!file) return res.status(404).json({message:'File unavailable'});
+ let output=file;
+ if(format==='png') output=await sharp(file).png().toBuffer();
+ if(format==='jpeg') output=await sharp(file).flatten({background:'#ffffff'}).jpeg({quality:95}).toBuffer();
+ const extension=format==='jpeg'?'jpg':format;
  await Image.updateOne({_id:item.id},{$inc:{downloads:1}});
- res.set({'Content-Type':'image/webp','Content-Disposition':`attachment; filename="${item.title.replace(/[^a-z0-9_-]/gi,'-')}.webp"`}).send(file);
+ res.set({'Content-Type':`image/${format}`,'Content-Disposition':`attachment; filename="${item.title.replace(/[^a-z0-9_-]/gi,'-')}.${extension}"`,'Cache-Control':'no-store'}).send(output);
 });
 app.post('/api/images',auth,upload.single('image'),async(req,res)=>{
  const title=String(req.body.title||'').trim(),category=req.body.category;
