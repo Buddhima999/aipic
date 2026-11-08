@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { storeFile, readFile, deleteFile, connect } from './storage.js';
 import path from 'node:path';
 import { base, categories, checkConfig } from './config.js';
-import { Image, Admin, Category } from './models.js';
+import { Image, Admin, Category, TrendingSnapshot } from './models.js';
 const app=express();
 app.disable('x-powered-by');
 app.use(helmet({contentSecurityPolicy:false,crossOriginResourcePolicy:{policy:'same-origin'}}));
@@ -24,6 +24,22 @@ const loginLimit=rateLimit({windowMs:15*60000,limit:10});
 function auth(req,res,next){try{const token=req.headers.authorization?.split(' ');if(token?.[0]!=='Bearer') throw Error();const data=jwt.verify(token[1],process.env.JWT_SECRET,{algorithms:['HS256']});if(data.role!=='admin') throw Error();req.admin=data;next();}catch{res.status(401).json({message:'Please sign in as admin.'});}}
 function validId(req,res,next){if(!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({message:'Invalid image ID'});next();}
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:4*1024*1024,files:1,fields:5},fileFilter(req,file,cb){cb(null,['image/jpeg','image/png','image/webp'].includes(file.mimetype));}});
+function shuffle(list){const result=[...list];for(let i=result.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[result[i],result[j]]=[result[j],result[i]];}return result;}
+async function refreshTrendingSnapshot(){
+ const now=new Date(),existing=await TrendingSnapshot.findOne({key:'global'}).lean();
+ if(existing&&now-existing.refreshedAt<48*60*60*1000)return existing;
+ const [newest,popular]=await Promise.all([
+  Image.find().sort({createdAt:-1,_id:-1}).limit(100).select('_id').lean(),
+  Image.find().sort({downloads:-1,_id:-1}).limit(100).select('_id').lean()
+ ]);
+ const newestPick=shuffle(newest).slice(0,12),chosen=new Set(newestPick.map(x=>String(x._id)));
+ const popularPick=shuffle(popular.filter(x=>!chosen.has(String(x._id)))).slice(0,12);
+ const remainder=shuffle([...newest,...popular].filter(x=>!chosen.has(String(x._id))&&!popularPick.some(p=>String(p._id)===String(x._id))));
+ const selected=shuffle([...newestPick,...popularPick,...remainder.slice(0,Math.max(0,24-newestPick.length-popularPick.length))]).map(x=>x._id);
+ if(existing){const updated=await TrendingSnapshot.findOneAndUpdate({key:'global',refreshedAt:existing.refreshedAt},{$set:{imageIds:selected,refreshedAt:now}},{new:true}).lean();return updated||await TrendingSnapshot.findOne({key:'global'}).lean();}
+ try{return await TrendingSnapshot.create({key:'global',imageIds:selected,refreshedAt:now});}
+ catch(error){if(error.code===11000)return await TrendingSnapshot.findOne({key:'global'}).lean();throw error;}
+}
 app.get('/api/health',(req,res)=>res.json({status:'ok'}));
 app.get('/api/categories',async(req,res)=>{const [custom,hidden]=await Promise.all([Category.find({active:true}).sort({name:1}).lean(),Category.find({active:false}).distinct('name')]);res.json([...new Set([...categories.filter(c=>!hidden.includes(c)),...custom.filter(c=>!categories.includes(c.name)).map(c=>c.name)])]);});
 app.post('/api/categories',auth,async(req,res)=>{const name=String(req.body.name||'').trim();if(!name||name.length>40)return res.status(400).json({message:'Category name must be 1–40 characters'});if(categories.some(c=>c.toLowerCase()===name.toLowerCase()))return res.status(409).json({message:'That category already exists'});try{const c=await Category.findOneAndUpdate({name},{$set:{active:true},$setOnInsert:{name}},{upsert:true,new:true});res.status(201).json(c);}catch(e){if(e.code===11000)return res.status(409).json({message:'That category already exists'});throw e;}});
@@ -48,8 +64,16 @@ app.get('/api/images',async(req,res)=>{
  if(q){const safe=q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');filter.$or=[{title:{$regex:safe,$options:'i'}},{tags:{$regex:safe,$options:'i'}},{description:{$regex:safe,$options:'i'}},{category:{$regex:safe,$options:'i'}}];}
  if(req.query.orientation==='portrait') filter.$expr={$gt:['$height','$width']};
  if(req.query.orientation==='landscape') filter.$expr={$gte:['$width','$height']};
- const sort=req.query.sort==='popular'?{downloads:-1,_id:-1}:req.query.sort==='trending'?{trending:-1,downloads:-1,createdAt:-1}:req.query.sort==='custom'?{order:1,createdAt:-1,_id:-1}:{createdAt:-1,_id:-1};
- if(req.query.sort==='trending')filter.trending=true;
+ if(req.query.sort==='trending'){
+  const snapshot=await refreshTrendingSnapshot();
+  const ids=snapshot?.imageIds||[];
+  const matches=await Image.find({...filter,_id:{$in:ids}}).lean();
+  const rank=new Map(ids.map((id,index)=>[String(id),index]));
+  matches.sort((a,b)=>(rank.get(String(a._id))??Infinity)-(rank.get(String(b._id))??Infinity));
+  const total=matches.length,items=matches.slice((page-1)*limit,page*limit);
+  return res.json({items,total,page,pages:Math.ceil(total/limit)});
+ }
+ const sort=req.query.sort==='popular'?{downloads:-1,_id:-1}:req.query.sort==='custom'?{order:1,createdAt:-1,_id:-1}:{createdAt:-1,_id:-1};
  if(req.query.sort==='newest'&&await Image.exists({...filter,featuredNewest:true}))filter.featuredNewest=true;
  const [items,total]=await Promise.all([Image.find(filter).sort(sort).skip((page-1)*limit).limit(limit).lean(),Image.countDocuments(filter)]);
  res.json({items,total,page,pages:Math.ceil(total/limit)});
@@ -83,7 +107,7 @@ app.post('/api/images',auth,upload.single('image'),async(req,res)=>{
  res.status(201).json(item);
  } catch(error){await Promise.all([filename,thumbnail].map(f=>deleteFile(f).catch(()=>{})));if(error.name==='ValidationError') throw error;res.status(400).json({message:'Upload failed. Use a valid image under 40 megapixels; check server logs if this persists.'});console.error(error.message);}
 });
-app.patch('/api/images/:id',auth,validId,async(req,res)=>{const item=await Image.findById(req.params.id);if(!item)return res.status(404).json({message:'Image not found'});const {title,category,description,tags,order,downloads,trending,featuredNewest,featuredPopular}=req.body;if(title!==undefined){const v=String(title).trim();if(!v||v.length>120)return res.status(400).json({message:'Title must be 1–120 characters'});item.title=v;}if(category!==undefined){const hidden=await Category.find({active:false}).distinct('name');const allowed=[...categories.filter(c=>!hidden.includes(c)),...(await Category.find({active:true}).distinct('name'))];if(!allowed.includes(category))return res.status(400).json({message:'Choose an available category'});item.category=category;}if(description!==undefined)item.description=String(description).slice(0,1000);if(tags!==undefined)item.tags=[...new Set((Array.isArray(tags)?tags:String(tags).split(',')).map(t=>String(t).trim().slice(0,40)).filter(Boolean))].slice(0,15);if(order!==undefined){const n=Number(order);if(!Number.isInteger(n)||n<0||n>1000000)return res.status(400).json({message:'Order must be a positive whole number'});item.order=n;}if(downloads!==undefined){const n=Number(downloads);if(!Number.isSafeInteger(n)||n<0)return res.status(400).json({message:'Download count must be a non-negative whole number'});item.downloads=n;}if(trending!==undefined)item.trending=Boolean(trending);if(featuredNewest!==undefined)item.featuredNewest=Boolean(featuredNewest);if(featuredPopular!==undefined)item.featuredPopular=Boolean(featuredPopular);await item.save();res.json(item);});
+app.patch('/api/images/:id',auth,validId,async(req,res)=>{const item=await Image.findById(req.params.id);if(!item)return res.status(404).json({message:'Image not found'});const {title,category,description,tags,order,downloads,featuredNewest,featuredPopular}=req.body;if(title!==undefined){const v=String(title).trim();if(!v||v.length>120)return res.status(400).json({message:'Title must be 1–120 characters'});item.title=v;}if(category!==undefined){const hidden=await Category.find({active:false}).distinct('name');const allowed=[...categories.filter(c=>!hidden.includes(c)),...(await Category.find({active:true}).distinct('name'))];if(!allowed.includes(category))return res.status(400).json({message:'Choose an available category'});item.category=category;}if(description!==undefined)item.description=String(description).slice(0,1000);if(tags!==undefined)item.tags=[...new Set((Array.isArray(tags)?tags:String(tags).split(',')).map(t=>String(t).trim().slice(0,40)).filter(Boolean))].slice(0,15);if(order!==undefined){const n=Number(order);if(!Number.isInteger(n)||n<0||n>1000000)return res.status(400).json({message:'Order must be a positive whole number'});item.order=n;}if(downloads!==undefined){const n=Number(downloads);if(!Number.isSafeInteger(n)||n<0)return res.status(400).json({message:'Download count must be a non-negative whole number'});item.downloads=n;}if(featuredNewest!==undefined)item.featuredNewest=Boolean(featuredNewest);if(featuredPopular!==undefined)item.featuredPopular=Boolean(featuredPopular);await item.save();res.json(item);});
 app.delete('/api/images/:id',auth,validId,async(req,res)=>{
  const item=await Image.findById(req.params.id);if(!item) return res.status(404).json({message:'Image not found'});
  await Image.deleteOne({_id:item.id});
