@@ -50,8 +50,7 @@ app.get('/api/images',async(req,res)=>{
  if(req.query.orientation==='landscape') filter.$expr={$gte:['$width','$height']};
  const sort=req.query.sort==='popular'?{downloads:-1,_id:-1}:req.query.sort==='trending'?{trending:-1,downloads:-1,createdAt:-1}:req.query.sort==='custom'?{order:1,createdAt:-1,_id:-1}:{createdAt:-1,_id:-1};
  if(req.query.sort==='trending')filter.trending=true;
- if(req.query.sort==='newest')filter.featuredNewest=true;
- if(req.query.sort==='popular')filter.featuredPopular=true;
+ if(req.query.sort==='newest'&&await Image.exists({...filter,featuredNewest:true}))filter.featuredNewest=true;
  const [items,total]=await Promise.all([Image.find(filter).sort(sort).skip((page-1)*limit).limit(limit).lean(),Image.countDocuments(filter)]);
  res.json({items,total,page,pages:Math.ceil(total/limit)});
 });
